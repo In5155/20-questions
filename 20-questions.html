@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>20 Questions Game</title>
+
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+  import { getDatabase, ref, set, get, push, onValue, update } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
+
+  // 🔥 REPLACE WITH YOUR FIREBASE CONFIG
+  const firebaseConfig = {
+  apiKey: "AIzaSyCVbgOvbwIcgHnbJMkU3QT4QiSv4lXdj3s",
+  authDomain: "questions-59eff.firebaseapp.com",
+  projectId: "questions-59eff",
+  storageBucket: "questions-59eff.firebasestorage.app",
+  messagingSenderId: "929508737795",
+  appId: "1:929508737795:web:458babc93bb6be47f5df36",
+  measurementId: "G-RXWCZVD539"
+};
+
+  const app = initializeApp(firebaseConfig);
+  const db  = getDatabase(app);
+
+  let roomId = null, myRole = null, myName = "", gameState = {};
+  const $ = id => document.getElementById(id);
+  function genRoomCode() { return Math.random().toString(36).substr(2,6).toUpperCase(); }
+  function showScreen(id) {
+    document.querySelectorAll(".screen").forEach(s => s.classList.remove("active"));
+    $(id).classList.add("active");
+  }
+
+  $("btn-create").onclick = async () => {
+    myName = $("inp-name-create").value.trim();
+    if (!myName) return shake($("inp-name-create"));
+    roomId = genRoomCode(); myRole = "player1";
+    await set(ref(db, `rooms/${roomId}`), {
+      players: { player1: myName, player2: "" },
+      game: { phase:"waiting", p1QuestionsAnswered:0, p2QuestionsAnswered:0,
+              currentQuestion:"", currentAnswer:"", pendingQuestion:false, pendingAnswer:false },
+      chat:{}, history:{}
+    });
+    $("room-code-display").textContent = roomId;
+    showScreen("screen-waiting");
+    listenRoom();
+  };
+
+  $("btn-join").onclick = async () => {
+    myName = $("inp-name-join").value.trim();
+    const code = $("inp-room-code").value.trim().toUpperCase();
+    if (!myName) return shake($("inp-name-join"));
+    if (!code) return shake($("inp-room-code"));
+    const snap = await get(ref(db, `rooms/${code}`));
+    if (!snap.exists()) return showToast("Room not found!");
+    if (snap.val().players?.player2) return showToast("Room is full!");
+    roomId = code; myRole = "player2";
+    await update(ref(db, `rooms/${roomId}/players`), { player2: myName });
+    await update(ref(db, `rooms/${roomId}/game`), { phase: "p1asks" });
+    showScreen("screen-game");
+    listenRoom(); listenChat();
+  };
+
+  function listenRoom() {
+    onValue(ref(db, `rooms/${roomId}`), snap => {
+      if (!snap.exists()) return;
+      const data = snap.val();
+      gameState = data.game || {};
+      if (gameState.phase !== "waiting" && $("screen-waiting").classList.contains("active")) {
+        showScreen("screen-game"); listenChat();
+      }
+      renderGame(data);
+    });
+  }
+
+  function listenChat() {
+    onValue(ref(db, `rooms/${roomId}/chat`), snap => {
+      const box = $("chat-messages");
+      box.innerHTML = "";
+      if (!snap.exists()) return;
+      Object.values(snap.val()).sort((a,b)=>a.ts-b.ts).forEach(m => {
+        const div = document.createElement("div");
+        div.className = "chat-msg" + (m.sender === myName ? " mine" : "");
+        div.innerHTML = `<span class="chat-sender">${m.sender}</span><span class="chat-text">${esc(m.text)}</span>`;
+        box.appendChild(div);
+      });
+      box.scrollTop = box.scrollHeight;
+    });
+  }
+
+  function renderGame(data) {
+    const g = data.game, p1 = data.players?.player1 || "Player 1", p2 = data.players?.player2 || "Player 2";
+    $("label-p1").textContent = p1 + (myRole==="player1"?" (You)":"");
+    $("label-p2").textContent = p2 + (myRole==="player2"?" (You)":"");
+    $("progress-p1").style.width = Math.min(100,(g.p1QuestionsAnswered/20)*100)+"%";
+    $("progress-p2").style.width = Math.min(100,(g.p2QuestionsAnswered/20)*100)+"%";
+    $("count-p1").textContent = `${g.p1QuestionsAnswered}/20`;
+    $("count-p2").textContent = `${g.p2QuestionsAnswered}/20`;
+    $("phase-label").textContent = {
+      waiting:`Waiting for Player 2…`, p1asks:`${p1} asks → ${p2} answers`,
+      p2asks:`${p2} asks → ${p1} answers`, done:`🎉 Game Complete!`
+    }[g.phase] || "";
+    renderHistory(data.history);
+    const panel = $("interaction-panel");
+    panel.innerHTML = "";
+    if (g.phase === "done") {
+      panel.innerHTML = `<div class="done-msg"><div class="done-trophy">🏆</div><div class="done-text">Both players answered 20 questions each!<br>What a game!</div></div>`;
+      return;
+    }
+    if (g.phase === "waiting") { panel.innerHTML = `<p class="hint">Share the code with your friend ✌️</p>`; return; }
+    const iAmAsker = myRole === (g.phase==="p1asks"?"player1":"player2");
+    const iAmAnswerer = myRole === (g.phase==="p1asks"?"player2":"player1");
+    if (g.pendingAnswer) {
+      const qNum = g.phase==="p1asks" ? g.p2QuestionsAnswered : g.p1QuestionsAnswered;
+      panel.innerHTML = `<div class="qa-display"><div class="qa-q"><span class="qa-lbl">Q${qNum}</span>${esc(g.currentQuestion)}</div><div class="qa-a"><span class="qa-lbl">A</span>${esc(g.currentAnswer)}</div></div>${iAmAsker?`<button class="btn btn-next" id="btn-next">Next Question ➜</button>`:`<p class="hint">Waiting for asker to continue…</p>`}`;
+      if (iAmAsker) $("btn-next").onclick = advanceRound;
+    } else if (g.pendingQuestion) {
+      panel.innerHTML = `<div class="qa-display"><div class="qa-q"><span class="qa-lbl">❓</span>${esc(g.currentQuestion)}</div></div>${iAmAnswerer?`<div class="input-row"><input id="inp-ans" class="inp" placeholder="Your answer…" maxlength="280"/><button class="btn btn-send" id="btn-send-ans">Send</button></div>`:`<p class="hint">Waiting for answer…</p>`}`;
+      if (iAmAnswerer) { $("inp-ans").onkeydown=e=>{if(e.key==="Enter")$("btn-send-ans").click()}; $("btn-send-ans").onclick=sendAnswer; }
+    } else {
+      panel.innerHTML = iAmAsker ? `<div class="input-row"><input id="inp-q" class="inp" placeholder="Ask a question…" maxlength="280"/><button class="btn btn-send" id="btn-send-q">Ask</button></div>` : `<p class="hint">Waiting for a question…</p>`;
+      if (iAmAsker) { $("inp-q").onkeydown=e=>{if(e.key==="Enter")$("btn-send-q").click()}; $("btn-send-q").onclick=sendQuestion; }
+    }
+  }
+
+  function renderHistory(history) {
+    const box = $("history-list");
+    if (!history) { box.innerHTML = "<li class='hist-empty'>No questions yet</li>"; return; }
+    box.innerHTML = Object.values(history).sort((a,b)=>a.idx-b.idx).map(it=>`<li class="hist-item"><span class="hist-idx">#${it.idx}</span><div class="hist-qa"><div class="hist-q">${esc(it.question)}</div><div class="hist-a">${esc(it.answer)}</div></div></li>`).join("");
+    box.scrollTop = box.scrollHeight;
+  }
+
+  async function sendQuestion() {
+    const q = $("inp-q")?.value.trim(); if(!q) return;
+    await update(ref(db,`rooms/${roomId}/game`),{currentQuestion:q,currentAnswer:"",pendingQuestion:true,pendingAnswer:false});
+  }
+  async function sendAnswer() {
+    const a = $("inp-ans")?.value.trim(); if(!a) return;
+    await update(ref(db,`rooms/${roomId}/game`),{currentAnswer:a,pendingAnswer:true});
+  }
+  async function advanceRound() {
+  const g = gameState;
+
+  // Determine which player just got answered
+  let p1 = g.p1QuestionsAnswered;
+  let p2 = g.p2QuestionsAnswered;
+
+  // Increase the correct player's answered count
+  if (g.phase === "p1asks") {
+    p2++;
+  } else {
+    p1++;
+  }
+
+  // Save to history
+  const qNum = g.phase === "p1asks" ? p2 : p1;
+  await push(ref(db, `rooms/${roomId}/history`), {
+    idx: p1 + p2,
+    phase: g.phase,
+    question: g.currentQuestion,
+    answer: g.currentAnswer
+  });
+
+  // Check if game is finished
+  let newPhase = "p1asks";
+
+  if (p1 >= 20 && p2 >= 20) {
+    newPhase = "done";
+  } else {
+    // 🔁 Always swap turns after each question
+    newPhase = g.phase === "p1asks" ? "p2asks" : "p1asks";
+  }
+
+  await update(ref(db, `rooms/${roomId}/game`), {
+    phase: newPhase,
+    p1QuestionsAnswered: p1,
+    p2QuestionsAnswered: p2,
+    currentQuestion: "",
+    currentAnswer: "",
+    pendingQuestion: false,
+    pendingAnswer: false
+  });
+}
+
+  $("btn-send-chat").onclick = sendChat;
+  $("inp-chat").onkeydown = e => { if(e.key==="Enter") sendChat(); };
+  async function sendChat() {
+    const text = $("inp-chat").value.trim(); if(!text||!roomId) return;
+    await push(ref(db,`rooms/${roomId}/chat`),{sender:myName,text,ts:Date.now()});
+    $("inp-chat").value = "";
+  }
+  $("btn-copy-code").onclick = () => navigator.clipboard.writeText($("room-code-display").textContent).then(()=>showToast("Copied!"));
+  function esc(s=""){return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}
+  function showToast(msg){const t=$("toast");t.textContent=msg;t.classList.add("show");setTimeout(()=>t.classList.remove("show"),2500)}
+  function shake(el){el.classList.add("shake");setTimeout(()=>el.classList.remove("shake"),500)}
+</script>
+
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#0d1117;--surface:#161b22;--card:#21262d;--border:#30363d;--accent:#58a6ff;--accent2:#bc8cff;--green:#3fb950;--text:#e6edf3;--muted:#8b949e;--r:12px;--rs:8px}
+html,body{height:100%;font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);overflow:hidden}
+.screen{display:none;height:100vh}.screen.active{display:flex}
+#screen-lobby{align-items:center;justify-content:center;background:radial-gradient(ellipse at 60% 20%,#1a2332 0%,var(--bg) 70%)}
+.lobby-wrap{display:flex;flex-direction:column;align-items:center;gap:28px;width:100%;max-width:460px;padding:24px}
+.logo{font-size:52px;filter:drop-shadow(0 0 24px #58a6ff88)}
+.lobby-title{font-size:2rem;font-weight:800;letter-spacing:-1px}.lobby-title span{color:var(--accent)}
+.lobby-sub{color:var(--muted);font-size:.95rem;text-align:center}
+.lobby-cards{display:grid;grid-template-columns:1fr 1fr;gap:16px;width:100%}
+.lobby-card{background:var(--card);border:1px solid var(--border);border-radius:var(--r);padding:20px;display:flex;flex-direction:column;gap:12px}
+.lobby-card h3{font-size:.8rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
+.inp{width:100%;background:var(--surface);border:1px solid var(--border);border-radius:var(--rs);color:var(--text);padding:10px 14px;font-size:.95rem;outline:none;transition:border-color .2s}.inp:focus{border-color:var(--accent)}
+.btn{cursor:pointer;border:none;border-radius:var(--rs);padding:10px 18px;font-size:.95rem;font-weight:600;transition:opacity .15s,transform .1s}.btn:active{transform:scale(.97)}
+.btn-primary{background:var(--accent);color:#000}.btn-secondary{background:var(--accent2);color:#000}.btn-primary:hover,.btn-secondary:hover{opacity:.85}
+@keyframes shake{0%,100%{transform:translateX(0)}25%{transform:translateX(-6px)}75%{transform:translateX(6px)}}.shake{animation:shake .4s ease}
+#screen-waiting{align-items:center;justify-content:center;flex-direction:column;gap:24px;background:radial-gradient(ellipse at 40% 60%,#1a2332 0%,var(--bg) 70%)}
+.waiting-card{background:var(--card);border:1px solid var(--border);border-radius:var(--r);padding:36px 40px;text-align:center;display:flex;flex-direction:column;align-items:center;gap:20px;min-width:320px}
+.waiting-card h2{font-size:1.3rem}
+.code-box{display:flex;align-items:center;gap:12px;background:var(--surface);border:1px solid var(--border);border-radius:var(--rs);padding:12px 20px}
+#room-code-display{font-size:2rem;font-weight:800;letter-spacing:.2em;color:var(--accent);font-family:'Courier New',monospace}
+#btn-copy-code{background:var(--border);color:var(--text);font-size:.8rem;padding:6px 12px;border-radius:6px;cursor:pointer;border:none;transition:background .15s}#btn-copy-code:hover{background:var(--accent);color:#000}
+.spinner{width:40px;height:40px;border:3px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin 1s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
+#screen-game{flex-direction:row;overflow:hidden}
+.game-main{flex:1;display:flex;flex-direction:column;overflow:hidden;border-right:1px solid var(--border)}
+.game-header{padding:14px 20px;background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:16px;flex-shrink:0}
+.game-title{font-size:1.1rem;font-weight:700}#phase-label{font-size:.82rem;color:var(--accent);font-weight:600;text-align:right}
+.progress-section{padding:14px 20px;background:var(--surface);border-bottom:1px solid var(--border);display:flex;gap:20px;flex-shrink:0}
+.progress-player{flex:1}.progress-top{display:flex;justify-content:space-between;font-size:.78rem;margin-bottom:6px}
+.progress-name{font-weight:600}.progress-count{color:var(--accent);font-weight:700}
+.progress-bar-bg{height:8px;border-radius:99px;background:var(--border);overflow:hidden}
+.progress-bar-fill{height:100%;border-radius:99px;background:linear-gradient(90deg,var(--accent),var(--accent2));transition:width .5s ease;width:0%}
+.interaction-panel{padding:20px;display:flex;flex-direction:column;justify-content:center;align-items:center;gap:14px;flex-shrink:0;min-height:130px;border-bottom:1px solid var(--border)}
+.input-row{display:flex;gap:10px;width:100%;max-width:560px}.input-row .inp{flex:1}
+.btn-send{background:var(--accent);color:#000;font-weight:700;white-space:nowrap}.btn-next{background:var(--green);color:#000;font-weight:700;padding:10px 28px}
+.hint{color:var(--muted);font-size:.9rem;font-style:italic}
+.qa-display{width:100%;max-width:560px;display:flex;flex-direction:column;gap:8px}
+.qa-q,.qa-a{background:var(--card);border:1px solid var(--border);border-radius:var(--rs);padding:12px 16px;font-size:.95rem;display:flex;gap:12px;align-items:flex-start}.qa-a{border-color:var(--green)}
+.qa-lbl{font-weight:800;font-size:.78rem;text-transform:uppercase;color:var(--accent);white-space:nowrap;padding-top:2px}.qa-a .qa-lbl{color:var(--green)}
+.history-section{flex:1;overflow-y:auto;padding:16px 20px}
+.history-section h4{font-size:.78rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:12px}
+#history-list{list-style:none;display:flex;flex-direction:column;gap:8px}
+.hist-item{background:var(--card);border:1px solid var(--border);border-radius:var(--rs);padding:10px 14px;display:flex;gap:12px;align-items:flex-start;font-size:.88rem}
+.hist-idx{font-weight:800;color:var(--accent);min-width:28px;font-size:.8rem;padding-top:2px}
+.hist-qa{display:flex;flex-direction:column;gap:4px}.hist-q{color:var(--text)}.hist-a{color:var(--green);font-style:italic}
+.hist-empty{color:var(--muted);font-style:italic;font-size:.9rem;list-style:none}
+.done-msg{text-align:center;display:flex;flex-direction:column;align-items:center;gap:12px}.done-trophy{font-size:3rem;filter:drop-shadow(0 0 20px gold)}.done-text{font-size:1rem;line-height:1.6}
+.chat-sidebar{width:300px;display:flex;flex-direction:column;background:var(--surface);flex-shrink:0}
+.chat-header{padding:14px 16px;background:var(--card);border-bottom:1px solid var(--border);font-size:.85rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);display:flex;align-items:center;gap:8px;flex-shrink:0}
+.chat-dot{width:8px;height:8px;border-radius:50%;background:var(--green);flex-shrink:0}
+#chat-messages{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:8px}
+.chat-msg{display:flex;flex-direction:column;gap:2px;align-items:flex-start;max-width:90%}.chat-msg.mine{align-items:flex-end;align-self:flex-end}
+.chat-sender{font-size:.7rem;color:var(--muted);padding:0 4px}
+.chat-text{background:var(--card);border:1px solid var(--border);border-radius:10px 10px 10px 2px;padding:8px 12px;font-size:.88rem;line-height:1.4;word-break:break-word}
+.chat-msg.mine .chat-text{background:var(--accent);color:#000;border-color:var(--accent);border-radius:10px 10px 2px 10px}.chat-msg.mine .chat-sender{color:var(--accent)}
+.chat-input-row{padding:12px;border-top:1px solid var(--border);display:flex;gap:8px;flex-shrink:0}#inp-chat{flex:1}
+#btn-send-chat{background:var(--accent);color:#000;font-weight:700;font-size:.85rem;padding:10px 14px;border-radius:var(--rs);border:none;cursor:pointer}#btn-send-chat:hover{opacity:.85}
+#toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(60px);background:var(--card);border:1px solid var(--border);color:var(--text);padding:10px 22px;border-radius:99px;font-size:.9rem;pointer-events:none;transition:transform .3s ease,opacity .3s;opacity:0;z-index:999}#toast.show{transform:translateX(-50%) translateY(0);opacity:1}
+::-webkit-scrollbar{width:6px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--border);border-radius:99px}
+@media(max-width:700px){.lobby-cards{grid-template-columns:1fr}#screen-game{flex-direction:column}.game-main{border-right:none;border-bottom:1px solid var(--border)}.chat-sidebar{width:100%;height:260px}}
+</style>
+</head>
+<body>
+
+<div class="screen active" id="screen-lobby">
+  <div class="lobby-wrap">
+    <div class="logo">🎯</div>
+    <div><div class="lobby-title"><span>20</span> Questions</div><div class="lobby-sub">Ask. Answer. Swap. Repeat.</div></div>
+    <div class="lobby-cards">
+      <div class="lobby-card">
+        <h3>Create Room</h3>
+        <input id="inp-name-create" class="inp" placeholder="Your name" maxlength="24"/>
+        <button class="btn btn-primary" id="btn-create">Create Game</button>
+      </div>
+      <div class="lobby-card">
+        <h3>Join Room</h3>
+        <input id="inp-name-join" class="inp" placeholder="Your name" maxlength="24"/>
+        <input id="inp-room-code" class="inp" placeholder="Room code" maxlength="6" style="text-transform:uppercase"/>
+        <button class="btn btn-secondary" id="btn-join">Join Game</button>
+      </div>
+    </div>
+    <p style="font-size:.75rem;color:var(--muted);text-align:center;">Player 1 asks 20 questions first, then roles swap.</p>
+  </div>
+</div>
+
+<div class="screen" id="screen-waiting">
+  <div class="waiting-card">
+    <h2>Room Created! 🎉</h2>
+    <p style="color:var(--muted);font-size:.9rem;">Share this code with your friend:</p>
+    <div class="code-box"><div id="room-code-display">XXXXXX</div><button id="btn-copy-code">Copy</button></div>
+    <div class="spinner"></div>
+    <p style="color:var(--muted);font-size:.85rem;">Waiting for Player 2…</p>
+  </div>
+</div>
+
+<div class="screen" id="screen-game">
+  <div class="game-main">
+    <div class="game-header"><div class="game-title">🎯 20 Questions</div><div id="phase-label">—</div></div>
+    <div class="progress-section">
+      <div class="progress-player">
+        <div class="progress-top"><span class="progress-name" id="label-p1">Player 1</span><span class="progress-count" id="count-p1">0/20</span></div>
+        <div class="progress-bar-bg"><div class="progress-bar-fill" id="progress-p1"></div></div>
+      </div>
+      <div class="progress-player">
+        <div class="progress-top"><span class="progress-name" id="label-p2">Player 2</span><span class="progress-count" id="count-p2">0/20</span></div>
+        <div class="progress-bar-bg"><div class="progress-bar-fill" id="progress-p2" style="background:linear-gradient(90deg,var(--accent2),#f778ba)"></div></div>
+      </div>
+    </div>
+    <div class="interaction-panel" id="interaction-panel"><p class="hint">Loading…</p></div>
+    <div class="history-section"><h4>📜 Question History</h4><ul id="history-list"><li class="hist-empty">No questions yet</li></ul></div>
+  </div>
+  <div class="chat-sidebar">
+    <div class="chat-header"><div class="chat-dot"></div>Live Chat</div>
+    <div id="chat-messages"></div>
+    <div class="chat-input-row"><input id="inp-chat" class="inp" placeholder="Message…" maxlength="200"/><button id="btn-send-chat">→</button></div>
+  </div>
+</div>
+
+<div id="toast"></div>
+</body>
+</html>
