@@ -7,23 +7,24 @@
 
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-  import { getDatabase, ref, set, get, push, onValue, update } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
+  import { getDatabase, ref, set, get, push, onValue, update, remove } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
 
-  // 🔥 REPLACE WITH YOUR FIREBASE CONFIG
   const firebaseConfig = {
-  apiKey: "AIzaSyCVbgOvbwIcgHnbJMkU3QT4QiSv4lXdj3s",
-  authDomain: "questions-59eff.firebaseapp.com",
-  projectId: "questions-59eff",
-  storageBucket: "questions-59eff.firebasestorage.app",
-  messagingSenderId: "929508737795",
-  appId: "1:929508737795:web:458babc93bb6be47f5df36",
-  measurementId: "G-RXWCZVD539"
-};
+    apiKey: "AIzaSyCVbgOvbwIcgHnbJMkU3QT4QiSv4lXdj3s",
+    authDomain: "questions-59eff.firebaseapp.com",
+    projectId: "questions-59eff",
+    storageBucket: "questions-59eff.firebasestorage.app",
+    messagingSenderId: "929508737795",
+    appId: "1:929508737795:web:458babc93bb6be47f5df36",
+    measurementId: "G-RXWCZVD539"
+  };
 
   const app = initializeApp(firebaseConfig);
   const db  = getDatabase(app);
 
   let roomId = null, myRole = null, myName = "", gameState = {};
+  let typingTimer = null;
+  let chatListening = false, typingListening = false;
   const $ = id => document.getElementById(id);
   function genRoomCode() { return Math.random().toString(36).substr(2,6).toUpperCase(); }
   function showScreen(id) {
@@ -39,7 +40,7 @@
       players: { player1: myName, player2: "" },
       game: { phase:"waiting", p1QuestionsAnswered:0, p2QuestionsAnswered:0,
               currentQuestion:"", currentAnswer:"", pendingQuestion:false, pendingAnswer:false },
-      chat:{}, history:{}
+      chat:{}, history:{}, typing:{}
     });
     $("room-code-display").textContent = roomId;
     showScreen("screen-waiting");
@@ -58,7 +59,7 @@
     await update(ref(db, `rooms/${roomId}/players`), { player2: myName });
     await update(ref(db, `rooms/${roomId}/game`), { phase: "p1asks" });
     showScreen("screen-game");
-    listenRoom(); listenChat();
+    listenRoom(); listenChat(); listenTyping();
   };
 
   function listenRoom() {
@@ -67,27 +68,93 @@
       const data = snap.val();
       gameState = data.game || {};
       if (gameState.phase !== "waiting" && $("screen-waiting").classList.contains("active")) {
-        showScreen("screen-game"); listenChat();
+        showScreen("screen-game"); listenChat(); listenTyping();
       }
       renderGame(data);
     });
   }
 
-  function listenChat() {
-    onValue(ref(db, `rooms/${roomId}/chat`), snap => {
-      const box = $("chat-messages");
-      box.innerHTML = "";
-      if (!snap.exists()) return;
-      Object.values(snap.val()).sort((a,b)=>a.ts-b.ts).forEach(m => {
-        const div = document.createElement("div");
-        div.className = "chat-msg" + (m.sender === myName ? " mine" : "");
-        div.innerHTML = `<span class="chat-sender">${m.sender}</span><span class="chat-text">${esc(m.text)}</span>`;
-        box.appendChild(div);
-      });
-      box.scrollTop = box.scrollHeight;
+  // ── Typing indicator ──────────────────────────────────────────────────────
+  function listenTyping() {
+    if (typingListening) return;
+    typingListening = true;
+    const otherRole = myRole === "player1" ? "player2" : "player1";
+    onValue(ref(db, `rooms/${roomId}/typing/${otherRole}`), snap => {
+      const bubble = $("typing-bubble");
+      if (snap.exists() && Date.now() - snap.val() < 4000) {
+        bubble.classList.add("visible");
+      } else {
+        bubble.classList.remove("visible");
+      }
     });
   }
 
+  function broadcastTyping() {
+    if (!roomId) return;
+    update(ref(db, `rooms/${roomId}/typing`), { [myRole]: Date.now() });
+    clearTimeout(typingTimer);
+    typingTimer = setTimeout(() => {
+      remove(ref(db, `rooms/${roomId}/typing/${myRole}`));
+    }, 3000);
+  }
+
+  function clearTyping() {
+    clearTimeout(typingTimer);
+    if (roomId) remove(ref(db, `rooms/${roomId}/typing/${myRole}`));
+  }
+
+  // ── Chat ──────────────────────────────────────────────────────────────────
+  function listenChat() {
+    if (chatListening) return;
+    chatListening = true;
+    onValue(ref(db, `rooms/${roomId}/chat`), snap => {
+      const box = $("chat-messages");
+      box.innerHTML = "";
+      if (!snap.exists()) { box.appendChild(buildTypingBubble()); return; }
+
+      const messages = Object.entries(snap.val()).sort((a,b)=>a[1].ts-b[1].ts);
+
+      messages.forEach(([key, m]) => {
+        const isMine = m.sender === myName;
+        const div = document.createElement("div");
+        div.className = "chat-msg" + (isMine ? " mine" : "");
+        let receipt = "";
+        if (isMine) {
+          receipt = m.read
+            ? `<span class="receipt read" title="Read">✓✓</span>`
+            : `<span class="receipt sent" title="Sent">✓</span>`;
+        }
+        div.innerHTML = `
+          <span class="chat-sender">${esc(m.sender)}</span>
+          <div class="chat-bubble-row">
+            <span class="chat-text">${esc(m.text)}</span>
+            ${receipt}
+          </div>`;
+        box.appendChild(div);
+      });
+
+      box.appendChild(buildTypingBubble());
+      box.scrollTop = box.scrollHeight;
+
+      // Batch-mark unread messages as read in one write (avoids re-triggering onValue)
+      const unread = messages.filter(([, m]) => m.sender !== myName && !m.read);
+      if (unread.length > 0) {
+        const updates = {};
+        unread.forEach(([key]) => { updates[`rooms/${roomId}/chat/${key}/read`] = true; });
+        update(ref(db), updates);
+      }
+    });
+  }
+
+  function buildTypingBubble() {
+    const wrap = document.createElement("div");
+    wrap.id = "typing-bubble";
+    wrap.className = "typing-bubble";
+    wrap.innerHTML = `<span></span><span></span><span></span>`;
+    return wrap;
+  }
+
+  // ── Game rendering (unchanged) ────────────────────────────────────────────
   function renderGame(data) {
     const g = data.game, p1 = data.players?.player1 || "Player 1", p2 = data.players?.player2 || "Player 2";
     $("label-p1").textContent = p1 + (myRole==="player1"?" (You)":"");
@@ -139,56 +206,66 @@
     await update(ref(db,`rooms/${roomId}/game`),{currentAnswer:a,pendingAnswer:true});
   }
   async function advanceRound() {
-  const g = gameState;
-
-  // Determine which player just got answered
-  let p1 = g.p1QuestionsAnswered;
-  let p2 = g.p2QuestionsAnswered;
-
-  // Increase the correct player's answered count
-  if (g.phase === "p1asks") {
-    p2++;
-  } else {
-    p1++;
+    const g = gameState;
+    let p1 = g.p1QuestionsAnswered;
+    let p2 = g.p2QuestionsAnswered;
+    if (g.phase === "p1asks") { p2++; } else { p1++; }
+    const qNum = g.phase === "p1asks" ? p2 : p1;
+    await push(ref(db, `rooms/${roomId}/history`), {
+      idx: p1 + p2, phase: g.phase, question: g.currentQuestion, answer: g.currentAnswer
+    });
+    let newPhase = "p1asks";
+    if (p1 >= 20 && p2 >= 20) { newPhase = "done"; }
+    else { newPhase = g.phase === "p1asks" ? "p2asks" : "p1asks"; }
+    await update(ref(db, `rooms/${roomId}/game`), {
+      phase: newPhase, p1QuestionsAnswered: p1, p2QuestionsAnswered: p2,
+      currentQuestion: "", currentAnswer: "", pendingQuestion: false, pendingAnswer: false
+    });
   }
 
-  // Save to history
-  const qNum = g.phase === "p1asks" ? p2 : p1;
-  await push(ref(db, `rooms/${roomId}/history`), {
-    idx: p1 + p2,
-    phase: g.phase,
-    question: g.currentQuestion,
-    answer: g.currentAnswer
-  });
-
-  // Check if game is finished
-  let newPhase = "p1asks";
-
-  if (p1 >= 20 && p2 >= 20) {
-    newPhase = "done";
-  } else {
-    // 🔁 Always swap turns after each question
-    newPhase = g.phase === "p1asks" ? "p2asks" : "p1asks";
-  }
-
-  await update(ref(db, `rooms/${roomId}/game`), {
-    phase: newPhase,
-    p1QuestionsAnswered: p1,
-    p2QuestionsAnswered: p2,
-    currentQuestion: "",
-    currentAnswer: "",
-    pendingQuestion: false,
-    pendingAnswer: false
-  });
-}
-
+  // ── Chat input with typing events ─────────────────────────────────────────
   $("btn-send-chat").onclick = sendChat;
   $("inp-chat").onkeydown = e => { if(e.key==="Enter") sendChat(); };
+  $("inp-chat").oninput = () => broadcastTyping();
+
   async function sendChat() {
     const text = $("inp-chat").value.trim(); if(!text||!roomId) return;
-    await push(ref(db,`rooms/${roomId}/chat`),{sender:myName,text,ts:Date.now()});
+    clearTyping();
+    await push(ref(db,`rooms/${roomId}/chat`),{sender:myName, text, ts:Date.now(), read:false});
     $("inp-chat").value = "";
   }
+
+  // ── Draggable resizer ─────────────────────────────────────────────────────
+  const resizer = $("resizer");
+  let isResizing = false;
+
+  resizer.addEventListener("mousedown", e => {
+    isResizing = true;
+    resizer.classList.add("dragging");
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    e.preventDefault();
+  });
+
+  document.addEventListener("mousemove", e => {
+    if (!isResizing) return;
+    const screen = $("screen-game");
+    const screenRect = screen.getBoundingClientRect();
+    const minMain = 300, minChat = 180;
+    const newChatWidth = screenRect.right - e.clientX - 6;
+    const maxChat = screenRect.width - minMain - 6 - 24;
+    const clampedChat = Math.min(Math.max(newChatWidth, minChat), maxChat);
+    document.querySelector(".chat-sidebar").style.width = clampedChat + "px";
+  });
+
+  document.addEventListener("mouseup", () => {
+    if (!isResizing) return;
+    isResizing = false;
+    resizer.classList.remove("dragging");
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+  });
+
   $("btn-copy-code").onclick = () => navigator.clipboard.writeText($("room-code-display").textContent).then(()=>showToast("Copied!"));
   function esc(s=""){return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}
   function showToast(msg){const t=$("toast");t.textContent=msg;t.classList.add("show");setTimeout(()=>t.classList.remove("show"),2500)}
@@ -219,8 +296,8 @@ html,body{height:100%;font-family:'Segoe UI',system-ui,sans-serif;background:var
 #room-code-display{font-size:2rem;font-weight:800;letter-spacing:.2em;color:var(--accent);font-family:'Courier New',monospace}
 #btn-copy-code{background:var(--border);color:var(--text);font-size:.8rem;padding:6px 12px;border-radius:6px;cursor:pointer;border:none;transition:background .15s}#btn-copy-code:hover{background:var(--accent);color:#000}
 .spinner{width:40px;height:40px;border:3px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin 1s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
-#screen-game{flex-direction:row;overflow:hidden}
-.game-main{flex:1;display:flex;flex-direction:column;overflow:hidden;border-right:1px solid var(--border)}
+#screen-game{flex-direction:row;overflow:hidden;gap:12px;padding:12px;background:var(--bg)}
+.game-main{flex:1;display:flex;flex-direction:column;overflow:hidden;border-radius:var(--r);border:1px solid var(--border);min-width:300px}
 .game-header{padding:14px 20px;background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:16px;flex-shrink:0}
 .game-title{font-size:1.1rem;font-weight:700}#phase-label{font-size:.82rem;color:var(--accent);font-weight:600;text-align:right}
 .progress-section{padding:14px 20px;background:var(--surface);border-bottom:1px solid var(--border);display:flex;gap:20px;flex-shrink:0}
@@ -243,14 +320,41 @@ html,body{height:100%;font-family:'Segoe UI',system-ui,sans-serif;background:var
 .hist-qa{display:flex;flex-direction:column;gap:4px}.hist-q{color:var(--text)}.hist-a{color:var(--green);font-style:italic}
 .hist-empty{color:var(--muted);font-style:italic;font-size:.9rem;list-style:none}
 .done-msg{text-align:center;display:flex;flex-direction:column;align-items:center;gap:12px}.done-trophy{font-size:3rem;filter:drop-shadow(0 0 20px gold)}.done-text{font-size:1rem;line-height:1.6}
-.chat-sidebar{width:300px;display:flex;flex-direction:column;background:var(--surface);flex-shrink:0}
+
+/* ── Resizer ── */
+.resizer{width:6px;cursor:col-resize;flex-shrink:0;display:flex;align-items:center;justify-content:center;position:relative;z-index:10;background:transparent;transition:background .15s}
+.resizer:hover,.resizer.dragging{background:var(--accent)}
+.resizer-handle{width:2px;height:40px;border-radius:99px;background:var(--border);transition:background .15s,height .15s}
+.resizer:hover .resizer-handle,.resizer.dragging .resizer-handle{background:var(--accent);height:60px}
+
+/* ── Chat sidebar ── */
+.chat-sidebar{width:300px;min-width:180px;display:flex;flex-direction:column;background:var(--surface);flex-shrink:0;border-radius:var(--r);border:1px solid var(--border)}
 .chat-header{padding:14px 16px;background:var(--card);border-bottom:1px solid var(--border);font-size:.85rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);display:flex;align-items:center;gap:8px;flex-shrink:0}
 .chat-dot{width:8px;height:8px;border-radius:50%;background:var(--green);flex-shrink:0}
 #chat-messages{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:8px}
 .chat-msg{display:flex;flex-direction:column;gap:2px;align-items:flex-start;max-width:90%}.chat-msg.mine{align-items:flex-end;align-self:flex-end}
 .chat-sender{font-size:.7rem;color:var(--muted);padding:0 4px}
+.chat-bubble-row{display:flex;align-items:flex-end;gap:4px}
 .chat-text{background:var(--card);border:1px solid var(--border);border-radius:10px 10px 10px 2px;padding:8px 12px;font-size:.88rem;line-height:1.4;word-break:break-word}
 .chat-msg.mine .chat-text{background:var(--accent);color:#000;border-color:var(--accent);border-radius:10px 10px 2px 10px}.chat-msg.mine .chat-sender{color:var(--accent)}
+
+/* Read receipts */
+.receipt{font-size:.65rem;font-weight:700;line-height:1;padding-bottom:2px;transition:color .3s}
+.receipt.sent{color:var(--muted)}
+.receipt.read{color:var(--accent)}
+
+/* ── Typing bubble ── */
+.typing-bubble{display:none;align-items:center;gap:5px;padding:10px 14px;background:var(--card);border:1px solid var(--border);border-radius:10px 10px 10px 2px;width:fit-content;margin-top:2px}
+.typing-bubble.visible{display:flex}
+.typing-bubble span{width:7px;height:7px;border-radius:50%;background:var(--muted);animation:typingDot 1.2s infinite ease-in-out}
+.typing-bubble span:nth-child(1){animation-delay:0s}
+.typing-bubble span:nth-child(2){animation-delay:.2s}
+.typing-bubble span:nth-child(3){animation-delay:.4s}
+@keyframes typingDot{
+  0%,60%,100%{transform:translateY(0);opacity:.5}
+  30%{transform:translateY(-5px);opacity:1}
+}
+
 .chat-input-row{padding:12px;border-top:1px solid var(--border);display:flex;gap:8px;flex-shrink:0}#inp-chat{flex:1}
 #btn-send-chat{background:var(--accent);color:#000;font-weight:700;font-size:.85rem;padding:10px 14px;border-radius:var(--rs);border:none;cursor:pointer}#btn-send-chat:hover{opacity:.85}
 #toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(60px);background:var(--card);border:1px solid var(--border);color:var(--text);padding:10px 22px;border-radius:99px;font-size:.9rem;pointer-events:none;transition:transform .3s ease,opacity .3s;opacity:0;z-index:999}#toast.show{transform:translateX(-50%) translateY(0);opacity:1}
@@ -307,6 +411,7 @@ html,body{height:100%;font-family:'Segoe UI',system-ui,sans-serif;background:var
     <div class="interaction-panel" id="interaction-panel"><p class="hint">Loading…</p></div>
     <div class="history-section"><h4>📜 Question History</h4><ul id="history-list"><li class="hist-empty">No questions yet</li></ul></div>
   </div>
+  <div class="resizer" id="resizer"><div class="resizer-handle"></div></div>
   <div class="chat-sidebar">
     <div class="chat-header"><div class="chat-dot"></div>Live Chat</div>
     <div id="chat-messages"></div>
